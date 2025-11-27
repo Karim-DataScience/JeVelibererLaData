@@ -1,0 +1,634 @@
+from fastapi import FastAPI, Depends, HTTPException, APIRouter, Query, status
+from pydantic import BaseModel
+from typing import List, Optional, Any
+import datetime as dt
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, Session
+
+
+
+# =================================================================
+# 1. CONFIGURATION DE LA BASE DE DONNÉES
+# =================================================================
+
+# Remplacez ces valeurs par vos propres identifiants PostgreSQL
+DB_CONFIG = {
+    'user': 'postgres',
+    'password': '213',
+    'host': 'localhost',
+    'port': '5432',
+    'database': 'JeVelibererLaData'
+}
+
+DB_URL = f"postgresql+psycopg2://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+engine = create_engine(DB_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Dépendance pour la gestion de session BDD
+def get_db():
+    """Générateur de session BDD, utilisé par Depends(get_db) dans les routes."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+app = FastAPI(title="Vélib Analytics API")
+router = APIRouter()
+router_analysis = APIRouter(prefix="/api/v1/analysis", tags=["Analyse (V_TRAJETS)"])
+
+# =================================================================
+# 2. PYDANTIC MODELS (SCHEMAS)
+# =================================================================
+
+# Schéma pour la table Station (Dimension)
+class Station(BaseModel):
+    station_code: str
+    name: str
+    latitude: float
+    longitude: float
+    nbdock_total: Optional[int] = None
+
+    class Config:
+        # Permet de mapper les colonnes de la BDD (même si elles ne sont pas des attributs de classe)
+        from_attributes = True
+
+# Schéma pour l'état d'une station à un instant T (Fait)
+class EtatStation(BaseModel):
+    station_code: str
+    timestamp_capture: dt.datetime
+    nbbike: int
+    nbebike: int
+    nbfreedock: int
+    state: str
+
+    class Config:
+        from_attributes = True
+
+# Schéma pour un trajet inféré (Basé sur la VIEW V_TRAJETS)
+class Trajet(BaseModel):
+    velo_name: str
+    station_depart_code: str
+    heure_depart: dt.datetime
+    station_arrivee_code: str
+    heure_arrivee: dt.datetime
+    duree_trajet_minutes: float
+
+    class Config:
+        from_attributes = True
+
+# Schéma pour les statistiques agrégées (Exemple d'analyse)
+class TrajetStats(BaseModel):
+    station_depart_code: str
+    station_arrivee_code: str
+    nombre_trajets: int
+    duree_moyenne_minutes: float
+
+    class Config:
+        from_attributes = True
+
+
+# --- Base Models ---
+
+class StationBase(BaseModel):
+    station_code: str
+    name: str
+    latitude: float
+    longitude: float
+    type: str # Correspond à 'type' du JSON (ex: 'yes'/'no')
+
+class VeloBase(BaseModel):
+    velo_name: str
+    bikeelectric: Optional[bool] = None
+
+# --- Schemas de Lecture (Réponse API) ---
+
+class StationRead(StationBase):
+    nbdock_total: Optional[int] = None
+    maxbikeoverflow: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+class VeloRead(VeloBase):
+    class Config:
+        from_attributes = True
+        
+# --- Schemas de Création/Mise à jour pour les Faits (Simplifié) ---
+
+class LocalisationVeloRead(BaseModel):
+    loc_id: int
+    snapshot_id: int
+    velo_name: str
+    station_code: str
+    bikestatus: str
+    
+    class Config:
+        from_attributes = True
+
+
+
+class TrajetsByDayStats(BaseModel):
+    jour: dt.date
+    nombre_trajets: int
+    duree_moyenne_minutes: float
+
+    class Config:
+        from_attributes = True
+
+class StationTraffic(BaseModel):
+    station_code: str
+    station_name: str
+    type_flux: str  # 'Depart' ou 'Arrivee'
+    nombre_flux: int
+
+    class Config:
+        from_attributes = True
+
+class StationFlowImbalance(BaseModel):
+    station_code: str
+    station_name: str
+    departures: int
+    arrivals: int
+    imbalance: int # (Departures - Arrivals)
+
+    class Config:
+        from_attributes = True
+
+class TopVelo(BaseModel):
+    velo_name: str
+    nombre_trajets: int
+    duree_totale_heures: float # Durée totale convertie en heures
+
+    class Config:
+        from_attributes = True
+
+class AverageRouteStats(BaseModel):
+    station_depart_code: str
+    station_arrivee_code: str
+    duree_moyenne_minutes: float
+
+    class Config:
+        from_attributes = True
+
+# =================================================================
+# 3. ROUTES ANALYTIQUES PRINCIPALES
+# =================================================================
+
+# ----- STATIONS -----
+
+@app.get("/stations", response_model=List[Station], summary="Liste de toutes les stations")
+def read_stations(db: Session = Depends(get_db)):
+    """Retourne la liste complète des stations (Dimension STATION)."""
+    result = db.execute(text("SELECT station_code, name, latitude, longitude, nbdock_total FROM station")).all()
+    # SQLAlchemy retourne des Row objects, on les convertit en dictionnaires pour Pydantic
+    stations = [Station.model_validate(row, from_attributes=True) for row in result]
+    return stations
+
+
+@app.get("/stations/{station_code}/etat_actuel", response_model=EtatStation, summary="État le plus récent d'une station")
+def read_station_current_state(station_code: str, db: Session = Depends(get_db)):
+    """
+    Récupère le dernier état connu d'une station, basé sur le snapshot le plus récent.
+    """
+    sql_query = text("""
+        SELECT 
+            es.station_code, 
+            s.timestamp_capture, 
+            es.nbbike, es.nbebike, es.nbfreedock, es.state
+        FROM etat_station es
+        JOIN snapshot s ON es.snapshot_id = s.snapshot_id
+        WHERE es.station_code = :code
+        ORDER BY s.timestamp_capture DESC
+        LIMIT 1;
+    """)
+    result = db.execute(sql_query, {"code": station_code}).first()
+    
+    if result is None:
+        raise HTTPException(status_code=404, detail="Station ou état non trouvé")
+    
+    return EtatStation.model_validate(result, from_attributes=True)
+
+# ----- TRAJETS -----
+
+@app.get("/trajets", response_model=List[Trajet], summary="Liste des trajets inférés (PAGINÉE)")
+def read_trajets(
+    db: Session = Depends(get_db),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0)
+):
+    """
+    Retourne les trajets inférés à partir de la vue V_TRAJETS, avec pagination.
+    """
+    sql_query = text(f"""
+        SELECT *
+        FROM V_TRAJETS
+        ORDER BY heure_depart DESC
+        LIMIT :limit OFFSET :offset;
+    """)
+    
+    result = db.execute(sql_query, {"limit": limit, "offset": offset}).all()
+    trajets = [Trajet.model_validate(row, from_attributes=True) for row in result]
+    return trajets
+
+
+@app.get("/trajets/top_routes", response_model=List[TrajetStats], summary="Top 10 des trajets les plus populaires")
+def get_top_routes(
+    db: Session = Depends(get_db),
+    limit: int = Query(10, ge=1, le=100)
+):
+    """
+    Analyse les trajets pour trouver les paires (Départ/Arrivée) les plus fréquentes.
+    """
+    sql_query = text(f"""
+        SELECT 
+            station_depart_code,
+            station_arrivee_code,
+            COUNT(*) AS nombre_trajets,
+            AVG(duree_trajet_minutes) AS duree_moyenne_minutes
+        FROM V_TRAJETS
+        GROUP BY 1, 2
+        ORDER BY nombre_trajets DESC
+        LIMIT :limit;
+    """)
+    
+    result = db.execute(sql_query, {"limit": limit}).all()
+    stats = [TrajetStats.model_validate(row, from_attributes=True) for row in result]
+    return stats
+
+
+@app.get("/trajets/velos/{velo_name}/boomerang", summary="Vérifie si un vélo a effectué un trajet boomerang")
+def check_boomerang(velo_name: str, db: Session = Depends(get_db)):
+    """
+    Vérifie si le vélo a été rendu à sa station de départ au moins une fois.
+    """
+    sql_query = text("""
+        SELECT COUNT(*)
+        FROM V_TRAJETS
+        WHERE velo_name = :vn
+        AND station_depart_code = station_arrivee_code;
+    """)
+    
+    count = db.execute(sql_query, {"vn": velo_name}).scalar_one()
+    
+    if count == 0:
+        return {"velo_name": velo_name, "is_boomerang_user": False, "count": 0}
+    else:
+        return {"velo_name": velo_name, "is_boomerang_user": True, "count": count}
+
+
+# =================================================================
+# 3. ROUTER DIMENSIONS (CRUD COMPLET)
+# =================================================================
+
+router_dims = APIRouter(prefix="/api/v1/dimensions", tags=["Dimensions (CRUD)"])
+
+# ----- STATION CRUD -----
+
+@router_dims.get("/stations", response_model=List[StationRead])
+def read_all_stations(db: Session = Depends(get_db)):
+    result = db.execute(text("SELECT * FROM station ORDER BY station_code")).all()
+    return [StationRead.model_validate(row, from_attributes=True) for row in result]
+
+@router_dims.get("/stations/{code}", response_model=StationRead)
+def read_station(code: str, db: Session = Depends(get_db)):
+    result = db.execute(text("SELECT * FROM station WHERE station_code = :code"), {"code": code}).first()
+    if result is None:
+        raise HTTPException(status_code=404, detail="Station not found")
+    return StationRead.model_validate(result, from_attributes=True)
+
+@router_dims.post("/stations", status_code=status.HTTP_201_CREATED)
+def create_station(station: StationBase, db: Session = Depends(get_db)):
+    """
+    Crée une nouvelle station ou met à jour les champs si elle existe (UPSERT).
+    """
+    try:
+        db.execute(
+            text("""
+                INSERT INTO station (station_code, name, latitude, longitude, type)
+                VALUES (:station_code, :name, :latitude, :longitude, :type)
+                ON CONFLICT (station_code) DO UPDATE 
+                SET name = EXCLUDED.name, latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, type = EXCLUDED.type
+                RETURNING station_code;
+            """),
+            station.model_dump()
+        )
+        db.commit()
+        return {"message": f"Station {station.station_code} created or updated"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+@router_dims.delete("/stations/{code}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_station(code: str, db: Session = Depends(get_db)):
+    """
+    Supprime une station. Attention: cela peut nécessiter CASCADE ou DELETE dans les faits liés.
+    """
+    result = db.execute(text("DELETE FROM station WHERE station_code = :code RETURNING station_code;"), {"code": code})
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Station not found")
+    db.commit()
+    return
+
+# ----- VELO CRUD -----
+
+@router_dims.get("/velos", response_model=List[VeloRead])
+def read_all_velos(db: Session = Depends(get_db)):
+    result = db.execute(text("SELECT * FROM velo ORDER BY velo_name")).all()
+    return [VeloRead.model_validate(row, from_attributes=True) for row in result]
+
+@router_dims.post("/velos", status_code=status.HTTP_201_CREATED)
+def create_velo(velo: VeloBase, db: Session = Depends(get_db)):
+    """Crée un nouveau vélo. ON CONFLICT DO NOTHING si le vélo existe déjà."""
+    try:
+        db.execute(
+            text("""
+                INSERT INTO velo (velo_name, bikeelectric)
+                VALUES (:velo_name, :bikeelectric)
+                ON CONFLICT (velo_name) DO NOTHING;
+            """),
+            velo.model_dump()
+        )
+        db.commit()
+        return {"message": f"Velo {velo.velo_name} created or ignored"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    
+# Nécessite que router_analysis soit défini et get_db importé
+
+@router_analysis.get("/trajets/by_day", response_model=List[TrajetsByDayStats], summary="Statistiques de trajets agrégées par jour")
+def get_trajets_by_day(
+    db: Session = Depends(get_db),
+    start_date: Optional[dt.date] = Query(None, description="Date de début (YYYY-MM-DD)"),
+    end_date: Optional[dt.date] = Query(None, description="Date de fin (YYYY-MM-DD)")
+):
+    """
+    Calcule le nombre total et la durée moyenne des trajets par jour,
+    potentiellement filtré par une plage de dates.
+    """
+    
+    where_clause = []
+    params = {}
+    
+    if start_date:
+        where_clause.append("date(heure_depart) >= :start_date")
+        params['start_date'] = start_date
+        
+    if end_date:
+        where_clause.append("date(heure_depart) <= :end_date")
+        params['end_date'] = end_date
+        
+    where_sql = f"WHERE {' AND '.join(where_clause)}" if where_clause else ""
+
+    sql_query = text(f"""
+        SELECT 
+            date(heure_depart) AS jour, 
+            COUNT(*) AS nombre_trajets,
+            AVG(duree_trajet_minutes) AS duree_moyenne_minutes
+        FROM V_TRAJETS
+        {where_sql}
+        GROUP BY 1
+        ORDER BY jour;
+    """)
+    
+    result = db.execute(sql_query, params).all()
+    return [TrajetsByDayStats.model_validate(row, from_attributes=True) for row in result]
+
+
+@router_analysis.get("/stations/top_source_destination", response_model=List[StationTraffic], summary="Top N des stations générant le plus de départs/arrivées")
+def get_top_source_destination(
+    db: Session = Depends(get_db),
+    limit: int = Query(20, ge=1, le=100)
+):
+    """
+    Identifie les stations les plus sollicitées, en distinguant Départs et Arrivées.
+    """
+    sql_query = text(f"""
+        WITH Flux AS (
+            -- Départs
+            SELECT 
+                station_depart_code AS station_code,
+                'Depart' AS type_flux,
+                COUNT(*) AS nombre_flux
+            FROM V_TRAJETS GROUP BY 1
+            UNION ALL
+            -- Arrivées
+            SELECT 
+                station_arrivee_code AS station_code,
+                'Arrivee' AS type_flux,
+                COUNT(*) AS nombre_flux
+            FROM V_TRAJETS GROUP BY 1
+        )
+        SELECT 
+            f.station_code,
+            s.name AS station_name,
+            f.type_flux,
+            SUM(f.nombre_flux) AS nombre_flux
+        FROM Flux f
+        JOIN station s ON s.station_code = f.station_code
+        GROUP BY f.station_code, s.name, f.type_flux
+        ORDER BY nombre_flux DESC
+        LIMIT :limit;
+    """)
+    
+    result = db.execute(sql_query, {"limit": limit}).all()
+    return [StationTraffic.model_validate(row, from_attributes=True) for row in result]
+
+
+@router_analysis.get("/stations/flow_imbalance", response_model=List[StationFlowImbalance], summary="Déséquilibre de flux (Départs - Arrivées)")
+def get_flow_imbalance(
+    db: Session = Depends(get_db),
+    limit: int = Query(20, ge=1, le=100)
+):
+    """
+    Calcule l'écart entre les départs et les arrivées pour chaque station.
+    Un déséquilibre positif (Départs > Arrivées) indique une station qui se vide.
+    """
+    sql_query = text(f"""
+        WITH Departures AS (
+            SELECT station_depart_code AS code, COUNT(*) AS departures FROM V_TRAJETS GROUP BY 1
+        ),
+        Arrivals AS (
+            SELECT station_arrivee_code AS code, COUNT(*) AS arrivals FROM V_TRAJETS GROUP BY 1
+        )
+        SELECT 
+            s.station_code,
+            s.name AS station_name,
+            COALESCE(d.departures, 0) AS departures,
+            COALESCE(a.arrivals, 0) AS arrivals,
+            (COALESCE(d.departures, 0) - COALESCE(a.arrivals, 0)) AS imbalance
+        FROM station s
+        LEFT JOIN Departures d ON s.station_code = d.code
+        LEFT JOIN Arrivals a ON s.station_code = a.code
+        ORDER BY ABS(imbalance) DESC
+        LIMIT :limit;
+    """)
+    
+    result = db.execute(sql_query, {"limit": limit}).all()
+    return [StationFlowImbalance.model_validate(row, from_attributes=True) for row in result]
+
+
+@router_analysis.get("/velos/top_used", response_model=List[TopVelo], summary="Top N des vélos les plus utilisés (par nombre de trajets)")
+def get_top_used_velos(
+    db: Session = Depends(get_db),
+    limit: int = Query(10, ge=1, le=50)
+):
+    """
+    Liste les vélos ayant effectué le plus de trajets et leur temps d'utilisation total.
+    """
+    sql_query = text(f"""
+        SELECT 
+            velo_name,
+            COUNT(*) AS nombre_trajets,
+            SUM(duree_trajet_minutes) / 60.0 AS duree_totale_heures
+        FROM V_TRAJETS
+        GROUP BY velo_name
+        ORDER BY nombre_trajets DESC
+        LIMIT :limit;
+    """)
+    
+    result = db.execute(sql_query, {"limit": limit}).all()
+    return [TopVelo.model_validate(row, from_attributes=True) for row in result]
+
+
+@router_analysis.get("/trajets/average_by_route", response_model=List[AverageRouteStats], summary="Durée moyenne des trajets par paire de stations")
+def get_average_duration_by_route(
+    db: Session = Depends(get_db),
+    limit: int = Query(10, ge=1, le=50)
+):
+    """
+    Calcule la durée moyenne (en minutes) d'un trajet pour chaque paire unique 
+    de station de départ et d'arrivée.
+    """
+    sql_query = text(f"""
+        SELECT 
+            station_depart_code,
+            station_arrivee_code,
+            AVG(duree_trajet_minutes) AS duree_moyenne_minutes
+        FROM V_TRAJETS
+        GROUP BY 1, 2
+        ORDER BY duree_moyenne_minutes DESC
+        LIMIT :limit;
+    """)
+    
+    result = db.execute(sql_query, {"limit": limit}).all()
+    return [AverageRouteStats.model_validate(row, from_attributes=True) for row in result]
+
+# =================================================================
+# 4. ROUTER FAITS (LECTURE ET SUPPRESSION CIBLÉE)
+# =================================================================
+
+router_facts = APIRouter(prefix="/api/v1/facts", tags=["Faits (Lecture/Analyse)"])
+
+@router_facts.get("/localisations", response_model=List[LocalisationVeloRead], summary="Localisations récentes (Paginée)")
+def read_recent_locations(db: Session = Depends(get_db), limit: int = 100, offset: int = 0):
+    """Lecture des localisations de vélos. Fortement déconseillé d'augmenter la limite."""
+    sql_query = text(f"""
+        SELECT loc_id, snapshot_id, velo_name, station_code, bikestatus
+        FROM localisation_velo
+        ORDER BY loc_id DESC
+        LIMIT :limit OFFSET :offset;
+    """)
+    result = db.execute(sql_query, {"limit": limit, "offset": offset}).all()
+    return [LocalisationVeloRead.model_validate(row, from_attributes=True) for row in result]
+
+@router_facts.delete("/localisations/{loc_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_location(loc_id: int, db: Session = Depends(get_db)):
+    """Supprime une seule ligne de localisation par son ID (pour maintenance/correction)."""
+    result = db.execute(text("DELETE FROM localisation_velo WHERE loc_id = :id RETURNING loc_id;"), {"id": loc_id})
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Location ID not found")
+    db.commit()
+    return
+
+# =================================================================
+# 5. ROUTER ANALYSE (LE "PLUS" : Trajets et Statistiques)
+# =================================================================
+
+router_analysis = APIRouter(prefix="/api/v1/analysis", tags=["Analyse (V_TRAJETS)"])
+
+# Modèles Pydantic pour l'analyse (inchangés)
+class Trajet(BaseModel):
+    velo_name: str
+    station_depart_code: str
+    heure_depart: dt.datetime
+    station_arrivee_code: str
+    heure_arrivee: dt.datetime
+    duree_trajet_minutes: float
+
+    class Config:
+        from_attributes = True
+
+class TrajetStats(BaseModel):
+    station_depart_code: str
+    station_arrivee_code: str
+    nombre_trajets: int
+    duree_moyenne_minutes: float
+
+    class Config:
+        from_attributes = True
+
+
+@router_analysis.get("/trajets", response_model=List[Trajet], summary="Trajets inférés (Paginée)")
+def read_trajets(
+    db: Session = Depends(get_db),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0)
+):
+    sql_query = text(f"""
+        SELECT velo_name, station_depart_code, heure_depart, station_arrivee_code, heure_arrivee, duree_trajet_minutes
+        FROM V_TRAJETS
+        ORDER BY heure_depart DESC
+        LIMIT :limit OFFSET :offset;
+    """)
+    
+    result = db.execute(sql_query, {"limit": limit, "offset": offset}).all()
+    return [Trajet.model_validate(row, from_attributes=True) for row in result]
+
+
+@router_analysis.get("/trajets/top_routes", response_model=List[TrajetStats], summary="Top 10 des trajets les plus populaires")
+def get_top_routes(
+    db: Session = Depends(get_db),
+    limit: int = Query(10, ge=1, le=100)
+):
+    sql_query = text(f"""
+        SELECT 
+            station_depart_code,
+            station_arrivee_code,
+            COUNT(*) AS nombre_trajets,
+            AVG(duree_trajet_minutes) AS duree_moyenne_minutes
+        FROM V_TRAJETS
+        GROUP BY 1, 2
+        ORDER BY nombre_trajets DESC
+        LIMIT :limit;
+    """)
+    
+    result = db.execute(sql_query, {"limit": limit}).all()
+    return [TrajetStats.model_validate(row, from_attributes=True) for row in result]
+
+
+@router_analysis.get("/velos/{velo_name}/boomerang", summary="Vérifie si un vélo a effectué un trajet boomerang")
+def check_boomerang(velo_name: str, db: Session = Depends(get_db)):
+    sql_query = text("""
+        SELECT COUNT(*)
+        FROM V_TRAJETS
+        WHERE velo_name = :vn
+        AND station_depart_code = station_arrivee_code;
+    """)
+    
+    count = db.execute(sql_query, {"vn": velo_name}).scalar_one()
+    
+    return {"velo_name": velo_name, "is_boomerang_user": count > 0, "count": count}
+# =================================================================
+# 6. ENREGISTREMENT DES ROUTERS
+# =================================================================
+
+app.include_router(router_dims)
+app.include_router(router_facts)
+app.include_router(router_analysis)
+
+# Route racine pour l'état de l'API
+@app.get("/", tags=["Status"])
+def root():
+    return {"message": "Vélib Analysis API operational. Check /docs for endpoints."}

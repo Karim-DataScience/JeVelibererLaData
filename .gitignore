@@ -1,0 +1,17 @@
+# Environnement
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Données volumineuses
+data/
+progress.json
+
+# OS files
+.DS_Store
+Thumbs.db
