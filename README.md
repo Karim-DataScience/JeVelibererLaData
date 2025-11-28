@@ -272,7 +272,7 @@ Exemples de métriques disponibles :
 Ajoutez l’image :
 
 ```md
-![Pipeline](image/pipeline.png)
+![Pipeline](/image/XLRDRjj64BxpAGOk45k0BCLDWW.png)
 
 
 ```md
