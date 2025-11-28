@@ -277,3 +277,14 @@ Ajoutez l’image :
 
 ```md
 ![ERD](image/erd.png)
+
+🎯 Résumé
+
+Le pipeline permet :
+
+✔ Lecture robuste de 250 Go de données compressées
+✔ Résilience totale (progress.json, reprise automatique)
+✔ Traitement incrémental et idempotent
+✔ Chargement massif optimisé PostgreSQL
+✔ Reconstruction analytique des trajets Vélib
+✔ API complète pour exposer les données
